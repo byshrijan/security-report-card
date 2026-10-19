@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 
-app = FastAPI(title="Security Report Card API")
+from app.config import settings
+
+app = FastAPI(title=settings.app_name)
 
 
 @app.get("/api/health")
