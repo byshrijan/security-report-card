@@ -3,6 +3,7 @@ name = "backend"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+    "dnspython>=2.9.0",
     "fastapi[standard-no-fastapi-cloud-cli]>=0.147.0",
     "pydantic-settings>=2.16.0",
 ]
@@ -10,6 +11,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
     "ruff>=0.17.1",
 ]
 
