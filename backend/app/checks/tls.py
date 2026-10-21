@@ -1,5 +1,6 @@
 import asyncio
 import ssl
+import warnings
 from datetime import UTC, datetime
 
 from pydantic import BaseModel
@@ -19,6 +20,13 @@ class CertificateResult(BaseModel):
     issuer: str | None = None
     expires_at: datetime | None = None
     days_until_expiry: int | None = None
+
+
+class OldVersionsResult(BaseModel):
+    """Whether the site still accepts outdated TLS versions (None = unknown)."""
+
+    tls1_0: bool | None
+    tls1_1: bool | None
 
 
 async def check_certificate(domain: str, ip: IPAddress) -> CertificateResult:
@@ -43,7 +51,7 @@ async def check_certificate(domain: str, ip: IPAddress) -> CertificateResult:
         )
 
     cert = writer.get_extra_info("peercert")
-    writer.close()
+    writer.transport.abort()
 
     issuer = {key: value for part in cert["issuer"] for key, value in part}
     expires_at = datetime.fromtimestamp(
@@ -55,4 +63,42 @@ async def check_certificate(domain: str, ip: IPAddress) -> CertificateResult:
         issuer=issuer.get("organizationName"),
         expires_at=expires_at,
         days_until_expiry=(expires_at - datetime.now(UTC)).days,
+    )
+
+
+async def accepts_tls_version(
+    domain: str, ip: IPAddress, version: ssl.TLSVersion
+) -> bool | None:
+    """Return True if the server completes a handshake using only `version`.
+
+    Returns None if we couldn't tell because the server didn't answer in time.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    # Modern OpenSSL refuses old versions by default; lower that for this test.
+    context.set_ciphers("DEFAULT:@SECLEVEL=0")
+    with warnings.catch_warnings(action="ignore", category=DeprecationWarning):
+        context.minimum_version = version
+        context.maximum_version = version
+
+    try:
+        async with asyncio.timeout(TLS_TIMEOUT_SECONDS):
+            _, writer = await asyncio.open_connection(
+                str(ip), HTTPS_PORT, ssl=context, server_hostname=domain
+            )
+    except TimeoutError:
+        return None
+    except OSError:
+        return False
+
+    writer.transport.abort()
+    return True
+
+
+async def check_old_versions(domain: str, ip: IPAddress) -> OldVersionsResult:
+    """Check whether the site still accepts TLS 1.0 and TLS 1.1."""
+    return OldVersionsResult(
+        tls1_0=await accepts_tls_version(domain, ip, ssl.TLSVersion.TLSv1),
+        tls1_1=await accepts_tls_version(domain, ip, ssl.TLSVersion.TLSv1_1),
     )

@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.checks import tls
-from app.checks.tls import check_certificate
+from app.checks.tls import accepts_tls_version, check_certificate, check_old_versions
 
 SAFE_IP = ipaddress.ip_address("93.184.215.14")
 
@@ -24,17 +24,22 @@ def make_cert(days_left: int) -> dict[str, object]:
     }
 
 
+class FakeTransport:
+    """Stands in for the network connection underneath the writer."""
+
+    def abort(self) -> None:
+        pass
+
+
 class FakeWriter:
     """Stands in for the connection; our code only reads the cert and closes."""
 
     def __init__(self, cert: dict[str, object]) -> None:
         self.cert = cert
+        self.transport = FakeTransport()
 
     def get_extra_info(self, name: str) -> dict[str, object]:
         return self.cert
-
-    def close(self) -> None:
-        pass
 
 
 def use_fake_server(
@@ -141,3 +146,56 @@ async def test_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     result = await check_certificate("example.com", SAFE_IP)
     assert result.reachable is False
     assert result.error == "Connection timed out"
+
+
+@pytest.mark.asyncio
+async def test_old_versions_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    use_fake_server(monkeypatch, make_cert(days_left=30))
+    result = await check_old_versions("example.com", SAFE_IP)
+    assert result.tls1_0 is True
+    assert result.tls1_1 is True
+
+
+@pytest.mark.asyncio
+async def test_handshake_is_pinned_to_one_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = use_fake_server(monkeypatch, make_cert(days_left=30))
+    await accepts_tls_version("example.com", SAFE_IP, ssl.TLSVersion.TLSv1_1)
+    context = calls[0]["ssl"]
+    assert isinstance(context, ssl.SSLContext)
+    assert context.minimum_version == ssl.TLSVersion.TLSv1_1
+    assert context.maximum_version == ssl.TLSVersion.TLSv1_1
+    assert calls[0]["host"] == "93.184.215.14"
+    assert calls[0]["server_hostname"] == "example.com"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [ssl.SSLError("tlsv1 alert protocol version"), ConnectionResetError()],
+)
+async def test_old_versions_refused(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    use_failing_server(monkeypatch, error)
+    result = await check_old_versions("example.com", SAFE_IP)
+    assert result.tls1_0 is False
+    assert result.tls1_1 is False
+
+
+@pytest.mark.asyncio
+async def test_old_versions_timeout_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def never_answers(
+        host: str, port: int, **kwargs: object
+    ) -> tuple[None, FakeWriter]:
+        await asyncio.sleep(10)
+        raise AssertionError("timeout did not fire")
+
+    monkeypatch.setattr(asyncio, "open_connection", never_answers)
+    monkeypatch.setattr(tls, "TLS_TIMEOUT_SECONDS", 0.01)
+    result = await check_old_versions("example.com", SAFE_IP)
+    assert result.tls1_0 is None
+    assert result.tls1_1 is None
