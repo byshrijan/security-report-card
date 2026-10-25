@@ -4,29 +4,9 @@ import httpx
 import pytest
 
 from app.checks.redirect import check_https_redirect
+from tests.fakes import use_fake_server
 
 SAFE_IP = ipaddress.ip_address("93.184.215.14")
-
-
-def use_fake_server(
-    monkeypatch: pytest.MonkeyPatch, reply: httpx.Response | Exception
-) -> list[httpx.Request]:
-    """Route httpx to a fake server that answers with `reply`; return its requests."""
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if isinstance(reply, Exception):
-            raise reply
-        return reply
-
-    real_client = httpx.AsyncClient
-
-    def client_with_fake_transport(**kwargs: object) -> httpx.AsyncClient:
-        return real_client(transport=httpx.MockTransport(handler), **kwargs)
-
-    monkeypatch.setattr(httpx, "AsyncClient", client_with_fake_transport)
-    return requests
 
 
 def redirect_to(location: str, status_code: int = 301) -> httpx.Response:
