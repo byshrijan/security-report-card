@@ -1,5 +1,6 @@
 import dns.asyncresolver
 import dns.exception
+import dns.rdata
 import dns.resolver
 from pydantic import BaseModel
 
@@ -12,11 +13,11 @@ class DnsLookupError(Exception):
     """Raised when a DNS lookup fails for a reason other than "no record"."""
 
 
-async def fetch_txt_records(name: str) -> list[str]:
-    """Return every TXT record at `name`; empty if there are none."""
+async def resolve_records(name: str, record_type: str) -> list[dns.rdata.Rdata]:
+    """Return every `record_type` record at `name`; empty if there are none."""
     try:
         answer = await dns.asyncresolver.resolve(
-            name, "TXT", lifetime=DNS_TIMEOUT_SECONDS
+            name, record_type, lifetime=DNS_TIMEOUT_SECONDS
         )
     except dns.resolver.NXDOMAIN, dns.resolver.NoAnswer:
         return []
@@ -24,8 +25,14 @@ async def fetch_txt_records(name: str) -> list[str]:
         raise DnsLookupError("DNS lookup timed out") from None
     except dns.exception.DNSException:
         raise DnsLookupError("DNS lookup failed") from None
+    return list(answer)
+
+
+async def fetch_txt_records(name: str) -> list[str]:
+    """Return every TXT record at `name`; empty if there are none."""
+    records = await resolve_records(name, "TXT")
     # Long TXT records arrive as 255-byte chunks that must be rejoined.
-    return [b"".join(record.strings).decode(errors="replace") for record in answer]
+    return [b"".join(record.strings).decode(errors="replace") for record in records]
 
 
 class SpfResult(BaseModel):
@@ -111,3 +118,42 @@ async def check_email_dns(domain: str) -> EmailDnsResult:
         spf=parse_spf(spf_records),
         dmarc=parse_dmarc(dmarc_records),
     )
+
+
+class CaaResult(BaseModel):
+    """Facts about the CAA records that apply to a domain."""
+
+    found_at: str | None
+    issuers: list[str]
+
+
+def caa_lookup_names(domain: str) -> list[str]:
+    """List `domain` and its parents, nearest first, stopping before the TLD."""
+    labels = domain.split(".")
+    return [".".join(labels[i:]) for i in range(len(labels) - 1)]
+
+
+async def check_caa(domain: str) -> CaaResult:
+    """Find the CAA records for `domain`, climbing to parent names (RFC 8659)."""
+    for name in caa_lookup_names(domain):
+        records = await resolve_records(name, "CAA")
+        if records:
+            issuers = [
+                record.value.decode(errors="replace")
+                for record in records
+                if record.tag.lower() == b"issue"
+            ]
+            return CaaResult(found_at=name, issuers=issuers)
+    return CaaResult(found_at=None, issuers=[])
+
+
+class DnssecResult(BaseModel):
+    """Whether a domain has DNSSEC set up."""
+
+    enabled: bool
+
+
+async def check_dnssec(domain: str) -> DnssecResult:
+    """True if the parent zone publishes a DS record for `domain`."""
+    records = await resolve_records(domain, "DS")
+    return DnssecResult(enabled=bool(records))

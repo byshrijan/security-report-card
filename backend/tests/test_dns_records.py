@@ -1,3 +1,5 @@
+from collections.abc import Awaitable, Callable
+
 import dns.asyncresolver
 import dns.exception
 import dns.resolver
@@ -5,6 +7,9 @@ import pytest
 
 from app.checks.dns_records import (
     DnsLookupError,
+    caa_lookup_names,
+    check_caa,
+    check_dnssec,
     check_email_dns,
     fetch_txt_records,
     parse_dmarc,
@@ -17,6 +22,14 @@ class FakeTxtRecord:
 
     def __init__(self, *chunks: bytes) -> None:
         self.strings = chunks
+
+
+class FakeCaaRecord:
+    """Stands in for one CAA record; our code reads `.tag` and `.value`."""
+
+    def __init__(self, tag: bytes, value: bytes) -> None:
+        self.tag = tag
+        self.value = value
 
 
 def use_fake_dns(
@@ -148,3 +161,88 @@ async def test_check_email_dns_with_no_records(
     result = await check_email_dns("example.com")
     assert result.spf.record is None
     assert result.dmarc.record is None
+
+
+@pytest.mark.parametrize(
+    ("domain", "names"),
+    [
+        ("example.com", ["example.com"]),
+        (
+            "www.shop.example.com",
+            ["www.shop.example.com", "shop.example.com", "example.com"],
+        ),
+    ],
+)
+def test_caa_lookup_names(domain: str, names: list[str]) -> None:
+    assert caa_lookup_names(domain) == names
+
+
+@pytest.mark.asyncio
+async def test_check_caa_reads_issue_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    use_fake_dns(
+        monkeypatch,
+        {
+            "example.com": [
+                FakeCaaRecord(b"issue", b"letsencrypt.org"),
+                FakeCaaRecord(b"ISSUE", b"pki.goog"),
+                FakeCaaRecord(b"iodef", b"mailto:security@example.com"),
+            ]
+        },
+    )
+    result = await check_caa("example.com")
+    assert result.found_at == "example.com"
+    assert result.issuers == ["letsencrypt.org", "pki.goog"]
+
+
+@pytest.mark.asyncio
+async def test_check_caa_climbs_to_parent(monkeypatch: pytest.MonkeyPatch) -> None:
+    use_fake_dns(
+        monkeypatch, {"example.com": [FakeCaaRecord(b"issue", b"letsencrypt.org")]}
+    )
+    result = await check_caa("www.example.com")
+    assert result.found_at == "example.com"
+
+
+@pytest.mark.asyncio
+async def test_check_caa_nearest_records_win(monkeypatch: pytest.MonkeyPatch) -> None:
+    use_fake_dns(
+        monkeypatch,
+        {
+            "www.example.com": [FakeCaaRecord(b"issue", b"pki.goog")],
+            "example.com": [FakeCaaRecord(b"issue", b"letsencrypt.org")],
+        },
+    )
+    result = await check_caa("www.example.com")
+    assert result.found_at == "www.example.com"
+    assert result.issuers == ["pki.goog"]
+
+
+@pytest.mark.asyncio
+async def test_check_caa_with_no_records(monkeypatch: pytest.MonkeyPatch) -> None:
+    use_fake_dns(monkeypatch, {})
+    result = await check_caa("www.example.com")
+    assert result.found_at is None
+    assert result.issuers == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answers", "enabled"),
+    [({"example.com": [object()]}, True), ({}, False)],
+)
+async def test_check_dnssec(
+    monkeypatch: pytest.MonkeyPatch, answers: dict[str, list[object]], enabled: bool
+) -> None:
+    use_fake_dns(monkeypatch, answers)
+    result = await check_dnssec("example.com")
+    assert result.enabled is enabled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("check", [check_caa, check_dnssec])
+async def test_caa_and_dnssec_timeouts_raise_lookup_error(
+    monkeypatch: pytest.MonkeyPatch, check: Callable[[str], Awaitable[object]]
+) -> None:
+    use_fake_dns(monkeypatch, dns.exception.Timeout())
+    with pytest.raises(DnsLookupError, match="timed out"):
+        await check("example.com")
