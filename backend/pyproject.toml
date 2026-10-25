@@ -5,6 +5,7 @@ requires-python = ">=3.14"
 dependencies = [
     "dnspython>=2.9.0",
     "fastapi[standard-no-fastapi-cloud-cli]>=0.147.0",
+    "httpx>=0.28.1",
     "pydantic-settings>=2.16.0",
 ]
 
